@@ -1,0 +1,84 @@
+#!/bin/bash
+set -e
+
+readonly mysql_server="IPADDRESS_OR_HOSTNAME"
+readonly mysql_user="MYSQL_USER"
+readonly mysql_password="MYSQL_PASSWORD"
+readonly mysql_port=3306
+readonly logfile=/PATH/TO/LOG/${0##*/}
+readonly dumpopts='--order-by-primary --lines-terminated-by="\n" --fields-terminated-by="," --fields-enclosed-by=\" --compact --compatible=postgresql --default-character-set=binary --skip-tz-utc'
+readonly s3base="s3://S3_BUCKET_NAME/"
+readonly rsworkdb="REDSHIFT_WORK_DATABASE_NAME"
+readonly rsdb="REDSHIFT_DATABASE_NAME"
+readonly rsurl="REDSHIFT_URL"
+readonly rsport=5439
+readonly rsuser="REDSHIFT_USER"
+readonly rssql=./createtable.sql
+readonly s3accesskey="S3_ACCESS_KEY"
+readonly s3secretkey="S3_SECRET_KEY"
+readonly sensu_api_endpoint=SENSU_API_ENDPOINT
+readonly dump_database="database1 database2"
+
+readonly today=`date +'%Y%m%d'`
+readonly tmpdir=/tmp/${today}
+readonly s3credentials="CREDENTIALS 'aws_access_key_id=${s3accesskey};aws_secret_access_key=${s3secretkey}'"
+readonly mysql_opts="-u${mysql_user} -p${mysql_password} -T${tmpdir}/ -h${mysql_server} -P${mysql_port}"
+readonly cmd_awscli="/usr/local/bin/aws"
+readonly cmd_mysql=/usr/local/bin/mysql
+readonly cmd_mysqldump=/usr/local/bin/mysqldump
+readonly cmd_convert="./convert"
+readonly cmd_psql="/usr/local/bin/psql"
+readonly psql_opts="-h ${rsurl} -p ${rsport} -U ${rsuser}"
+
+exec 1> >(gawk '{print strftime("[%Y-%m-%d %H:%M:%S] "),$0 } { fflush() }' >> ${logfile})
+exec 2> >(gawk '{print strftime("[%Y-%m-%d %H:%M:%S] "),$0 } { fflush() }' >> ${logfile})
+
+# dump
+## create stash
+mysql_server_name=$(echo ${mysql_server} | tr '.' '-')
+curl -XPOST -d "{\"path\": \"silence/${mysql_server_name}\", \"content\": {\"reason\": \"dump for redshift sync\"}}" ${sensu_api_endpoint}/stashes
+sleep 3
+
+## stop slave
+ssh ${mysql_server} "${cmd_mysql} ${mysqlopts} -e'stop slave'"
+ssh ${mysql_server} "mkdir ${tmpdir} && chmod 777 ${tmpdir}"
+for database_name in ${dump_database}
+do
+  ssh ${mysql_server} "${cmd_mysqldump} ${mysql_opts} ${database_name} ${dumpopts}"
+done
+
+## start slave
+ssh ${mysql_server} "${cmd_mysql} ${mysqlopts} -e'start slave'"
+
+## delete stash
+curl -XDELETE ${sensu_api_endpoint}/stashes/silence/${mysql_server_name}
+
+scp -r ${mysql_server}:${tmpdir} /tmp
+
+# upload to s3
+find ${tmpdir} -type f -name '*.txt' | xargs sed -i "s/0000-00-00 00:00:00/1970-01-01 00:00:00/g"
+${cmd_awscli} s3 cp --recursive ${tmpdir} ${s3base}/${today}
+ssh ${mysql_server} "rm -rf ${tmpdir}"
+rm -rf ${tmpdir}
+
+# redshift
+rm -rf ${rssql}
+for database_name in ${dump_database}
+do
+  ${cmd_convert} ${database} >> ${rssql} 2> /dev/null
+done
+for table in $(${cmd_psql} ${psql_opts} -d ${rsdb} -Atc "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+do
+  ${cmd_psql} ${psql_opts} -d ${rsdb} -qc "DROP TABLE ${table}"
+done
+
+${cmd_psql} ${psql_opts} -d ${rsdb} -q < ${rssql}
+
+for filename in $(${cmd_awscli} s3 ls ${s3base}/${today}/ | awk '{print $4}')
+do
+  basename=${filename##*/}
+  if [ "${basename##*.}" == "txt" ]
+  then
+    ${cmd_psql} ${psql_opts} -d ${rsdb} -qc "COPY ${filename%.*} FROM '${s3base}/${today}/${filename}' ${s3credentials} MAXERROR 100 ESCAPE DELIMITER ',' REMOVEQUOTES COMPUPDATE ON COMPROWS 50000"
+  fi
+done

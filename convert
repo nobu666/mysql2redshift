@@ -1,0 +1,75 @@
+#!/bin/bash
+set -e
+
+if [ ! ${1} ]; then
+  errmsg="${0##*/}: No argument"
+  logger -s ${errmsg}
+  echo "usage: ${0##*/} [database]"
+  exit 1
+fi
+
+readonly cmd_mysqldump=/usr/local/bin/mysqldump
+readonly mysql_user="root"
+readonly mysql_password="P@ssw0rd"
+readonly mysql_host="HOSTNAME"
+readonly mysql_port=3306
+readonly dumpopts="--compact --compatible=ansi,no_table_options,no_key_options,no_field_options --force --no-data"
+
+${cmd_mysqldump} -u${mysql_user} -p${mysql_password} -h${mysql_host} -P${mysql_port} ${1} ${dumpopts} |
+  grep -v ' KEY "' |
+  grep -v ' UNIQUE KEY "' |
+  grep -v ' PRIMARY KEY ' |
+  grep -v ' CONSTRAINT "' |
+  sed '/^SET/d' |
+  sed 's/ unsigned / /g' |
+  sed 's/ zerofill / /g' |
+  sed 's/ auto_increment/ primary key autoincrement/g' |
+  sed 's/ tinyint([0-9]*) / smallint /g' |
+  sed 's/ smallint([0-9]*) / smallint /g' |
+  sed 's/ mediumint([0-9]*) / integer /g' |
+  sed 's/ int([0-9]*) / integer /g' |
+  sed 's/ bigint([0-9]*) / bigint /g' |
+  sed 's/ double / float /g' |
+  sed 's/ double(.*) / float /g' |
+  sed 's/ double, / float, /g' |
+  sed 's/ double(.*), / float, /g' |
+  sed 's/ float(.*)/ float /g' |
+  sed 's/ decimal(.*)/ decimal(29,2) /g' |
+  sed 's/ time / varchar(255) /g' |
+  sed 's/ time,/ varchar(255), /g' |
+  sed 's/ tinytext/ varchar(255) /g' |
+  sed 's/ text / varchar(max) /g' |
+  sed 's/ text,/ varchar(max), /g' |
+  sed 's/ mediumtext/ varchar(max) /g' |
+  sed 's/ longtext/ varchar(max) /g' |
+  sed 's/ tinyblob/ varchar(max) /g' |
+  sed 's/ blob/ varchar(max) /g' |
+  sed 's/ mediumblob/ varchar(max) /g' |
+  sed 's/ longblob/ varchar(max) /g' |
+  sed 's/ set(.*)/ varchar(max) /g' |
+  sed 's/ CHARACTER SET \w*/ /g' |
+  sed 's/ enum([^)]*) / varchar(255) /g' |
+  sed "s/ COMMENT.*'[^']*'/ /" |
+  sed "s/date DEFAULT '0000-00-00'/ date /g" |
+  sed "s/date NOT NULL DEFAULT '0000-00-00'/ date /g" |
+  sed "s/timestamp NOT NULL DEFAULT '0000-00-00 00:00:00'/ timestamp /g" |
+  sed "s/timestamp DEFAULT '0000-00-00 00:00:00'/ timestamp /g" |
+  sed "s/datetime NOT NULL DEFAULT '0000-00-00 00:00:00'/ datetime /g" |
+  sed "s/datetime DEFAULT '0000-00-00 00:00:00'/ datetime /g" |
+  sed 's/ on update [^,]*//g' |
+  sed 's/a/aA/g;s/__/aB/g;s/#/aC/g' | sed 's/aC/#/g;s/aB/__/g;s/aA/a/g' |
+  sed 's/ DEFAULT .*,/,/' |
+  sed 's/ DEFAULT .*//' |
+  sed 's/NOT NULL AUTO_INCREMENT,/,/' |
+  sed 's/NOT NULL//' |
+  sed 's/ char(.*)/ varchar(max)/' |
+  sed '/\/\*/d' |
+  sed -r ':a; s%(.*)/\*.*\*/%\1%; ta; /\/\*/ !b; N; ba' |
+  perl -e 'local $/;$_=<>;s/,\n\)/\n\)/gs;print "\n";print;print "\n"' |
+  perl -pe '
+    if (/^(INSERT.+?)\(/) {
+       $a=$1;
+       s/\\'\''/'\'\''/g;
+       s/\\n/\n/g;
+       s/\),\(/\);\n$a\(/g;
+    }'
